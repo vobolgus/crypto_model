@@ -108,73 +108,81 @@ def calculate_indicators(data):
         raise
 
 
-# 4. Генерация Торговых Сигналов
 def generate_signals(data, weights):
     try:
-        # Инициализация столбца сигналов
-        data['Signal'] = 0
+        # Инициализация сигналов для каждого индикатора
+        data['Signal_RSI'] = 0
+        data['Signal_MACD'] = 0
+        data['Signal_Stochastic'] = 0
+        data['Signal_OI'] = 0
+        data['Signal_Liquidations'] = 0
 
         # Сигналы RSI
-        data['Signal'] += np.where(data['RSI'] < 30, weights['RSI'], 0)
-        data['Signal'] += np.where(data['RSI'] > 70, -weights['RSI'], 0)
+        data['Signal_RSI'] = np.where(
+            data['RSI'] < 30, 1,
+            np.where(data['RSI'] > 70, -1, 0)
+        )
 
         # Сигналы MACD
-        data['Signal'] += np.where(
-            (data['MACD'] > data['MACD_signal']) & (data['MACD'].shift(1) <= data['MACD_signal'].shift(1)),
-            weights['MACD'],
-            0
-        )
-        data['Signal'] += np.where(
-            (data['MACD'] < data['MACD_signal']) & (data['MACD'].shift(1) >= data['MACD_signal'].shift(1)),
-            -weights['MACD'],
-            0
+        data['Signal_MACD'] = np.where(
+            (data['MACD'] > data['MACD_signal']) & (data['MACD'].shift(1) <= data['MACD_signal'].shift(1)), 1,
+            np.where(
+                (data['MACD'] < data['MACD_signal']) & (data['MACD'].shift(1) >= data['MACD_signal'].shift(1)), -1, 0
+            )
         )
 
         # Сигналы Стохастика
-        data['Signal'] += np.where(
-            (data['Stoch_%K'] > data['Stoch_%D']) & (data['Stoch_%K'].shift(1) <= data['Stoch_%D'].shift(1)) & (
-                        data['Stoch_%K'] < 20),
-            weights['Stochastic'],
-            0
-        )
-        data['Signal'] += np.where(
-            (data['Stoch_%K'] < data['Stoch_%D']) & (data['Stoch_%K'].shift(1) >= data['Stoch_%D'].shift(1)) & (
-                        data['Stoch_%K'] > 80),
-            -weights['Stochastic'],
-            0
+        data['Signal_Stochastic'] = np.where(
+            (data['Stoch_%K'] > data['Stoch_%D']) &
+            (data['Stoch_%K'].shift(1) <= data['Stoch_%D'].shift(1)) &
+            (data['Stoch_%K'] < 20), 1,
+            np.where(
+                (data['Stoch_%K'] < data['Stoch_%D']) &
+                (data['Stoch_%K'].shift(1) >= data['Stoch_%D'].shift(1)) &
+                (data['Stoch_%K'] > 80), -1, 0
+            )
         )
 
-        # Сигналы Open Interest и volume_usdt_liq
-        # Определение порогов для крупных изменений
+        # Сигналы Open Interest (OI)
         oi_threshold = data['oi'].quantile(0.95)
+        data['Signal_OI'] = np.where(data['oi'] > oi_threshold, 1, 0)
+
+        # Сигналы Ликвидаций
         liquidation_threshold = data['volume_usdt_liq'].quantile(0.95)
-
-        # Увеличение OI
-        data['Signal'] += np.where(
-            (data['oi'] > oi_threshold) & (data['Signal'] > 0),
-            weights['OI'],
-            0
-        )
-        data['Signal'] += np.where(
-            (data['oi'] > oi_threshold) & (data['Signal'] < 0),
-            -weights['OI'],
-            0
-        )
-
-        # Увеличение volume_usdt_liq
-        data['Signal'] += np.where(
-            (data['volume_usdt_liq'] > liquidation_threshold) & (data['Signal'] > 0),
-            weights['Liquidations'],
-            0
-        )
-        data['Signal'] += np.where(
-            (data['volume_usdt_liq'] > liquidation_threshold) & (data['Signal'] < 0),
-            -weights['Liquidations'],
-            0
-        )
+        data['Signal_Liquidations'] = np.where(data['volume_usdt_liq'] > liquidation_threshold, 1, 0)
 
         # Фильтр по ADX (только при сильном тренде)
-        data['Signal'] = np.where(data['ADX'] > 25, data['Signal'], 0)
+        data['Signal_RSI'] = np.where(data['ADX'] > 25, data['Signal_RSI'], 0)
+        data['Signal_MACD'] = np.where(data['ADX'] > 25, data['Signal_MACD'], 0)
+        data['Signal_Stochastic'] = np.where(data['ADX'] > 25, data['Signal_Stochastic'], 0)
+        # OI и Liquidations можно оставить без фильтра по ADX, если это соответствует вашей стратегии
+
+        # Создание списка индикаторов с их весами
+        indicators = [
+            ('Signal_RSI', 'RSI', weights['RSI']),
+            ('Signal_MACD', 'MACD', weights['MACD']),
+            ('Signal_Stochastic', 'Stochastic', weights['Stochastic']),
+            ('Signal_OI', 'OI', weights['OI']),
+            ('Signal_Liquidations', 'Liquidations', weights['Liquidations'])
+        ]
+
+        # Сортировка индикаторов по весам (приоритетам) в порядке убывания
+        indicators.sort(key=lambda x: x[2], reverse=True)
+
+        # Инициализация столбцов для финального сигнала и причины
+        data['Signal'] = 0
+        data['Signal_Reason'] = ''
+
+        # Функция для определения финального сигнала и причины
+        def determine_final_signal(row):
+            for col_name, reason_name, weight in indicators:
+                indicator_signal = row[col_name]
+                if indicator_signal != 0:
+                    return pd.Series({'Signal': indicator_signal, 'Signal_Reason': reason_name})
+            return pd.Series({'Signal': 0, 'Signal_Reason': ''})
+
+        # Применение функции к каждой строке данных
+        data[['Signal', 'Signal_Reason']] = data.apply(determine_final_signal, axis=1)
 
         logging.info('Торговые сигналы успешно сгенерированы.')
         return data
