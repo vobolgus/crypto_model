@@ -1,8 +1,7 @@
 import os
-from sqlalchemy import create_engine
-import pandas as pd
-from datetime import datetime, timedelta
 from dotenv import load_dotenv
+import clickhouse_connect
+import pandas as pd
 import logging
 
 # Настройка логирования
@@ -13,91 +12,182 @@ logging.basicConfig(
     filemode='w'
 )
 
-# Загрузка переменных окружения из .env файла
 load_dotenv()
 
-def fetch_data(timeframe_days=1):
-    """
-    Подключается к базе данных PostgreSQL, выполняет SQL-запросы и возвращает данные в виде pandas DataFrame.
-    Получает данные за последние timeframe_hours часов.
-    """
+
+def fetch_trade_bars(symbol='btc', exchange='binance', timeframe='5min', start_date='2024-11-01',
+                     end_date='2024-12-08'):
     try:
-        # Получение пароля из переменной окружения
-        db_password = 'fCExl7mD6mBbKJCU332eRf5YX8cIzYja'
-        if not db_password:
-            raise ValueError("Пароль к базе данных не установлен в переменной окружения PGPASSWORD.")
+        host = os.getenv('CLICKHOUSE_HOST', '136.243.21.210')
+        # Предположим, что сервер доступен по HTTP на порту 8123 (стандартный)
+        port = int(os.getenv('CLICKHOUSE_PORT', '8123'))
+        user = os.getenv('CLICKHOUSE_USER', 'oshu')
+        password = os.getenv('CLICKHOUSE_PASSWORD', 'oshu')
 
-        # Создание строки подключения для SQLAlchemy
-        engine = create_engine(f'postgresql+psycopg2://postgres:{db_password}@data.oshu.io:5432/oshu')
+        # Подключение без TLS
+        client = clickhouse_connect.get_client(
+            host=host,
+            port=port,
+            username=user,
+            password=password,
+            secure=False,
+            verify=False
+        )
 
-        # Определение временного диапазона
-        end_time = datetime.utcnow() - timedelta(days=90)
-        start_time = end_time - timedelta(days=90)
+        query = f"""
+        SELECT
+            symbol,
+            exchange,
+            open_timestamp,
+            countMerge(trades) as trades,
+            argMinMerge(open) as open,
+            high, low,
+            argMaxMerge(close) as close,
+            volume, sell_volume, buy_volume,
+            volume_usdt, buy_volume_usdt, sell_volume_usdt
+        FROM trades_aggregated
+        WHERE
+            tf = '{timeframe}'
+            AND symbol = '{symbol}'
+            AND exchange = '{exchange}'
+            AND open_timestamp BETWEEN '{start_date}' AND '{end_date}'
+        GROUP BY symbol, exchange, high, low, volume, sell_volume, buy_volume, volume_usdt, buy_volume_usdt, sell_volume_usdt, open_timestamp
+        ORDER BY open_timestamp
+        """
 
-        # Форматирование временных меток в формат ISO
-        start_timestamp = start_time.strftime('%Y-%m-%dT%H:%M:%S.000Z')
-        end_timestamp = end_time.strftime('%Y-%m-%dT%H:%M:%S.000Z')
+        result = client.query(query)
+        df = pd.DataFrame(result.result_set, columns=result.column_names)
+        logging.info(f"Успешно получены трейд бары: {len(df)} записей.")
+        return df
 
-        # SQL-запросы для разных типов данных
-        queries = {
-            'trade_bar': """
-                SELECT *
-                FROM tb.tb_30s_btc
-                WHERE "exchange" = %s
-                  AND "timestamp" BETWEEN %s AND %s
-                ORDER BY "timestamp" ASC NULLS LAST;
-            """,
-            'derivative_ticker_bar': """
-                SELECT *
-                FROM dt.dt_30s_btc
-                WHERE "exchange" = %s
-                  AND "timestamp" BETWEEN %s AND %s
-                ORDER BY "timestamp" ASC NULLS LAST;
-            """,
-            'liquidation_bar': """
-                SELECT *
-                FROM liq.liq_30s_btc
-                WHERE "exchange" = %s
-                  AND "timestamp" BETWEEN %s AND %s
-                ORDER BY "timestamp" ASC NULLS LAST;
-            """
-        }
+    except Exception as e:
+        logging.error("Ошибка при получении трейд баров из ClickHouse: %s", e)
+        return pd.DataFrame()
 
-        # Параметры запроса
-        params = ('binance-futures', start_timestamp, end_timestamp)
 
-        # Получение данных
-        trade_bar_df = pd.read_sql_query(queries['trade_bar'], engine, params=params)
-        logging.info('Данные TradeBar успешно загружены.')
+def fetch_derivative_bars(symbol='btc', exchange='binance-futures', timeframe='5min', start_date='2024-02-02',
+                          end_date='2024-02-03'):
+    try:
+        host = os.getenv('CLICKHOUSE_HOST', '136.243.21.210')
+        port = int(os.getenv('CLICKHOUSE_PORT', '8123'))
+        user = os.getenv('CLICKHOUSE_USER', 'oshu')
+        password = os.getenv('CLICKHOUSE_PASSWORD', 'oshu')
 
-        derivative_ticker_bar_df = pd.read_sql_query(queries['derivative_ticker_bar'], engine, params=params)
-        logging.info('Данные DerivativeTickerBar успешно загружены.')
+        client = clickhouse_connect.get_client(
+            host=host,
+            port=port,
+            username=user,
+            password=password,
+            secure=False,
+            verify=False
+        )
 
-        liquidation_bar_df = pd.read_sql_query(queries['liquidation_bar'], engine, params=params)
-        logging.info('Данные LiquidationBar успешно загружены.')
+        # Используем argMaxMerge для финализации данных AggregateFunction(argMax, ...)
+        # Выбираем только те колонки, которые реально существуют в таблице
+        query = f"""
+        SELECT
+            symbol,
+            exchange,
+            open_timestamp,
+            argMaxMerge(last_price) as last_price,
+            argMaxMerge(open_interest) as open_interest,
+            argMaxMerge(funding_rate) as funding_rate,
+            argMaxMerge(index_price) as index_price,
+            argMaxMerge(mark_price) as mark_price
+        FROM derivative_tickers_aggregated
+        WHERE
+            tf = '{timeframe}'
+            AND symbol = '{symbol}'
+            AND exchange = '{exchange}'
+            AND open_timestamp BETWEEN '{start_date}' AND '{end_date}'
+        GROUP BY symbol, exchange, open_timestamp
+        ORDER BY open_timestamp
+        """
 
-        return trade_bar_df, derivative_ticker_bar_df, liquidation_bar_df
+        result = client.query(query)
+        df = pd.DataFrame(result.result_set, columns=result.column_names)
+        logging.info(f"Успешно получены дериватив бары: {len(df)} записей.")
+        return df
 
-    except Exception as error:
-        logging.error("Ошибка при подключении к PostgreSQL или выполнении запроса: %s", error)
-        return None, None, None
-    finally:
-        if 'engine' in locals() and engine:
-            engine.dispose()
-            logging.info("Соединение с PostgreSQL закрыто.")
+    except Exception as e:
+        logging.error("Ошибка при получении дериватив баров из ClickHouse: %s", e)
+        return pd.DataFrame()
+
+
+def fetch_liquidation_bars(symbol='btc', exchange='binance-futures', timeframe='5min', start_date='2024-02-02',
+                           end_date='2024-02-03'):
+    try:
+        host = os.getenv('CLICKHOUSE_HOST', '136.243.21.210')
+        port = int(os.getenv('CLICKHOUSE_PORT', '8123'))
+        user = os.getenv('CLICKHOUSE_USER', 'oshu')
+        password = os.getenv('CLICKHOUSE_PASSWORD', 'oshu')
+
+        client = clickhouse_connect.get_client(host=host, port=port, username=user, password=password, secure=False,
+                                               verify=False)
+
+        query = f"""
+        SELECT
+            symbol,
+            exchange,
+            open_timestamp,
+            any(liqs) as liqs,
+            any(volume) as volume,
+            any(sell_volume) as sell_volume,
+            any(buy_volume) as buy_volume,
+            any(volume_usdt) as volume_usdt,
+            any(buy_volume_usdt) as buy_volume_usdt,
+            any(sell_volume_usdt) as sell_volume_usdt
+        FROM liquidations_aggregated
+        WHERE
+            tf = '{timeframe}'
+            AND symbol = '{symbol}'
+            AND exchange = '{exchange}'
+            AND open_timestamp BETWEEN '{start_date}' AND '{end_date}'
+        GROUP BY symbol, exchange, open_timestamp
+        ORDER BY open_timestamp
+        """
+
+        result = client.query(query)
+        df = pd.DataFrame(result.result_set, columns=result.column_names)
+        logging.info(f"Успешно получены ликвидационные бары: {len(df)} записей.")
+        return df
+
+    except Exception as e:
+        logging.error("Ошибка при получении ликвидационных баров из ClickHouse: %s", e)
+        return pd.DataFrame()
+
+def fetch_data(symbol='btc', exchange='binance-futures', timeframe='5min', start_date='2024-02-02',
+                           end_date='2024-02-03'):
+    trade_bar_df = fetch_trade_bars(symbol=symbol, exchange=exchange, timeframe=timeframe, start_date=start_date,
+                                    end_date=end_date)
+    derivative_bar_df = fetch_derivative_bars(symbol=symbol, exchange=exchange, timeframe=timeframe,
+                                              start_date=start_date, end_date=end_date)
+    liquidation_bar_df = fetch_liquidation_bars(symbol=symbol, exchange=exchange, timeframe=timeframe,
+                                                start_date=start_date, end_date=end_date)
+
+    if not trade_bar_df.empty:
+        trade_bar_df.to_csv('trade_bar_data.csv', index=False)
+    if not derivative_bar_df.empty:
+        derivative_bar_df.to_csv('derivative_ticker_bar_data.csv', index=False)
+    if not liquidation_bar_df.empty:
+        liquidation_bar_df.to_csv('liquidation_bar_data.csv', index=False)
+
+    return
+
 
 if __name__ == "__main__":
-    # Получение данных за последние 24 часа
-    trade_bar_df, derivative_ticker_bar_df, liquidation_bar_df = fetch_data(timeframe_days=30)
+    trade_bar_df = fetch_trade_bars(symbol='eth', exchange='binance-futures', timeframe='4h', start_date='2024-11-01',
+                                    end_date='2024-12-01')
+    derivative_bar_df = fetch_derivative_bars(symbol='btc', exchange='binance-futures', timeframe='5min',
+                                              start_date='2024-11-24', end_date='2024-12-01')
+    liquidation_bar_df = fetch_liquidation_bars(symbol='btc', exchange='binance-futures', timeframe='5min',
+                                                start_date='2024-11-24', end_date='2024-12-01')
 
-    if trade_bar_df is not None and not trade_bar_df.empty:
-        logging.info("Данные успешно получены и готовы к дальнейшей обработке.")
-    else:
-        logging.error("Не удалось получить данные из базы данных или данные пусты.")
-        exit()
+    if not trade_bar_df.empty:
+        trade_bar_df.to_csv('trade_bar_data.csv', index=False)
+    if not derivative_bar_df.empty:
+        derivative_bar_df.to_csv('derivative_ticker_bar_data.csv', index=False)
+    if not liquidation_bar_df.empty:
+        liquidation_bar_df.to_csv('liquidation_bar_data.csv', index=False)
 
-    # Сохранение данных в CSV-файлы (опционально)
-    trade_bar_df.to_csv('trade_bar_data.csv', index=False)
-    derivative_ticker_bar_df.to_csv('derivative_ticker_bar_data.csv', index=False)
-    liquidation_bar_df.to_csv('liquidation_bar_data.csv', index=False)
-    logging.info("Данные сохранены в CSV-файлы.")
+    logging.info("Данные успешно извлечены и сохранены.")

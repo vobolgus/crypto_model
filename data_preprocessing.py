@@ -2,32 +2,14 @@ import pandas as pd
 import numpy as np
 import logging
 
-# Настройка логирования
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     filename='trading_signals.log',
-    filemode='a'  # Добавлять логи к существующему файлу
+    filemode='a'
 )
 
-def fill_missing_values(df):
-    """
-    Функция для заполнения пропущенных значений методом forward fill и backward fill.
-    """
-    missing_values = df.isnull().sum()
-    if missing_values.any():
-        logging.warning(f'Пропущенные значения в данных:\n{missing_values}')
-        df.fillna(method='ffill', inplace=True)
-        df.fillna(method='bfill', inplace=True)
-        logging.info('Пропущенные значения заполнены методом forward/backward fill.')
-    else:
-        logging.info('Пропущенных значений в данных не обнаружено.')
-    return df
-
 def calculate_rsi(series, period=14):
-    """
-    Функция для вычисления RSI.
-    """
     delta = series.diff()
     gain = delta.where(delta > 0, 0.0)
     loss = -delta.where(delta < 0, 0.0)
@@ -38,89 +20,84 @@ def calculate_rsi(series, period=14):
     return rsi
 
 def preprocess_data(trade_bar_df, derivative_ticker_bar_df, liquidation_bar_df):
-    """
-    Предобработка данных: преобразование времени, заполнение пропущенных значений, объединение DataFrame,
-    вычисление индикаторов.
-    """
-    # Преобразование столбца 'timestamp' в datetime
-    trade_bar_df['timestamp'] = pd.to_datetime(trade_bar_df['timestamp'])
-    derivative_ticker_bar_df['timestamp'] = pd.to_datetime(derivative_ticker_bar_df['timestamp'])
-    liquidation_bar_df['timestamp'] = pd.to_datetime(liquidation_bar_df['timestamp'])
-    logging.info('Столбцы timestamp преобразованы в datetime.')
+    # Задаём точный формат дат для парсинга.
+    # Если ваши даты выглядят так: 2024-02-03 00:00:00.000000+00:00
+    # тогда используем следующий формат:
+    date_format = '%Y-%m-%d %H:%M:%S'
+    # liquidation_bar_df['open_timestamp'] = liquidation_bar_df['timestamp']
 
-    # Заполнение пропущенных значений
-    trade_bar_df = fill_missing_values(trade_bar_df)
-    derivative_ticker_bar_df = fill_missing_values(derivative_ticker_bar_df)
-    liquidation_bar_df = fill_missing_values(liquidation_bar_df)
+    for df_name, df in zip(['trade_bar_df', 'derivative_ticker_bar_df'],
+                           [trade_bar_df, derivative_ticker_bar_df, liquidation_bar_df]):
+        if 'open_timestamp' in df.columns:
+            df['open_timestamp'] = pd.to_datetime(df['open_timestamp'], format=date_format, errors='raise')
+            # df['open_timestamp'] = df['open_timestamp'].astype('int64') // 10 ** 9
+        else:
+            logging.warning(f"В {df_name} отсутствует колонка 'open_timestamp'.")
 
-    # Объединение данных по столбцу 'timestamp', 'symbol', 'exchange'
-    data = trade_bar_df.merge(
-        derivative_ticker_bar_df,
-        on=['timestamp', 'symbol', 'exchange'],
-        how='left',
-        suffixes=('_tb', '_dt')
-    )
-    data = data.merge(
-        liquidation_bar_df,
-        on=['timestamp', 'symbol', 'exchange'],
-        how='left',
-        suffixes=('', '_liq')  # оставшиеся столбцы из liquidation_bar_df будут без суффикса
-    )
-    logging.info('Данные объединены по столбцам timestamp, symbol, exchange.')
+    merge_keys = ['open_timestamp', 'symbol', 'exchange']
+    combined = pd.merge(trade_bar_df, derivative_ticker_bar_df, on=merge_keys, how='outer', suffixes=('_tb', '_dt'))
+    # combined = pd.merge(combined, liquidation_bar_df, on=merge_keys, how='outer', suffixes=('', '_liq'))
+    logging.info('Данные объединены (outer join) по open_timestamp, symbol, exchange.')
 
-    # Заполнение пропущенных значений после объединения
-    data = fill_missing_values(data)
-
-    # Вычисление CVD
-    data['delta_volume'] = data['buy_volume'] - data['sell_volume']
-    data['cvd'] = data['delta_volume'].cumsum()
-    logging.info('CVD рассчитан.')
-
-    # Вычисление изменения Open Interest (OI)
-    if 'oi' in data.columns:
-        data['oi_change'] = data['oi'].diff().fillna(0)
+    # Сортируем по open_timestamp для корректного временного порядка
+    if 'open_timestamp' in combined.columns:
+        combined.sort_values(by='open_timestamp')
+        logging.info('Данные отсортированы по open_timestamp.')
     else:
-        data['oi_change'] = 0
-    logging.info('Изменение Open Interest рассчитано.')
+        logging.warning('Отсутствует open_timestamp после объединения, сортировка невозможна.')
 
-    # Вычисление Ликвидаций
-    data['total_liquidations'] = data['buy_liqs'] + data['sell_liqs']
-    data['liquidation_volume'] = data['buy_volume_liq'] + data['sell_volume_liq']
-    logging.info('Ликвидации рассчитаны.')
+    # Заполняем пропущенные значения ближайшими известными по времени
+    combined.ffill(inplace=True)
 
-    # Вычисление изменения Funding Rates
-    if 'fr' in data.columns:
-        data['funding_rate_change'] = data['fr'].diff().fillna(0)
+    for col in ['close_timestamp', 'timestamp']:
+        if col in combined.columns:
+            combined.drop(columns=[col], inplace=True)
+            logging.info(f"Столбец {col} удалён из итоговых данных.")
+
+    # Рассчитываем CVD
+    if 'buy_volume' in combined.columns and 'sell_volume' in combined.columns:
+        combined['delta_volume'] = combined['buy_volume'] - combined['sell_volume']
+        combined['cvd'] = combined['delta_volume'].cumsum()
+        logging.info('CVD рассчитан.')
     else:
-        data['funding_rate_change'] = 0
-    logging.info('Изменение Funding Rates рассчитано.')
+        combined['cvd'] = np.nan
+        logging.warning('Отсутствуют buy_volume или sell_volume для расчёта CVD.')
 
-    # Дополнительные Индикаторы
-    data['ma_10'] = data['close'].rolling(window=10).mean()
-    data['ma_50'] = data['close'].rolling(window=50).mean()
-    data['rsi'] = calculate_rsi(data['close'])
-    logging.info('Дополнительные индикаторы (MA и RSI) рассчитаны.')
+    # Изменение OI
+    if 'open_interest' in combined.columns:
+        combined['oi_change'] = combined['open_interest'].diff().fillna(0)
+        logging.info('Изменение Open Interest рассчитано.')
+    else:
+        combined['oi_change'] = 0
 
-    # Переименование столбцов для удобства
-    data.rename(columns={
-        'close': 'close',
-        'volume': 'volume',
-        'buy_volume': 'buy_volume',
-        'sell_volume': 'sell_volume',
-        'vwap': 'vwap',
-    }, inplace=True)
+    # Изменение Funding Rate
+    if 'funding_rate' in combined.columns:
+        combined['funding_rate_change'] = combined['funding_rate'].diff().fillna(0)
+        logging.info('Изменение Funding Rates рассчитано.')
+    else:
+        combined['funding_rate_change'] = 0
 
-    return data
+    # Скользящие средние и RSI
+    if 'close' in combined.columns:
+        combined['ma_10'] = combined['close'].rolling(window=10, min_periods=1).mean()
+        combined['ma_50'] = combined['close'].rolling(window=50, min_periods=1).mean()
+        combined['rsi'] = calculate_rsi(combined['close'])
+        logging.info('MA и RSI рассчитаны.')
+    else:
+        combined['ma_10'] = np.nan
+        combined['ma_50'] = np.nan
+        combined['rsi'] = np.nan
+
+    return combined[combined['oi_change'] != 0]
 
 if __name__ == "__main__":
-    # Загрузка данных из CSV-файлов
+    # Загрузка данных
     trade_bar_df = pd.read_csv('trade_bar_data.csv')
     derivative_ticker_bar_df = pd.read_csv('derivative_ticker_bar_data.csv')
     liquidation_bar_df = pd.read_csv('liquidation_bar_data.csv')
 
-    # Предобработка данных
     data = preprocess_data(trade_bar_df, derivative_ticker_bar_df, liquidation_bar_df)
 
-    # Сохранение предобработанных данных (опционально)
     data.to_csv('preprocessed_data.csv', index=False)
-    logging.info('Предобработанные данные сохранены в файл preprocessed_data.csv.')
+    logging.info('Предобработанные данные сохранены в preprocessed_data.csv.')
+    print(data.columns)
